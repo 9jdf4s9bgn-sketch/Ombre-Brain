@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from errors import safe_error_detail
+from ombrebrain.integrations.provider_detect import endpoint_hostname
 from tools.plan.core import is_letter_bucket
 from utils import atomic_write_text, clean_llm_json, count_tokens_approx, now_iso, parse_bool
 
@@ -928,6 +929,43 @@ arousal: 0~1（0=平静, 0.5=普通, 1=激动）
 preserve_raw: true = 特殊情境/暗号/仪式，保留原文不摘要
 is_pattern: true = 反复出现的习惯性行为模式"""
 
+IMPORT_EXTRACT_JSON_OBJECT_PROMPT = IMPORT_EXTRACT_PROMPT.replace(
+    "当前对话片段的条目数控制在 0~5 个（没有值得记的就返回空数组；不同具体事件不要为了压缩条数而强行合并）",
+    "当前对话片段的条目数控制在 0~5 个（没有值得记的就返回 memories 空数组；不同具体事件不要为了压缩条数而强行合并）",
+).replace(
+    """输出格式（纯 JSON 数组，无其他内容）：
+[
+  {
+    "name": "条目标题（10字以内）",
+    "content": "整理后的内容",
+    "domain": ["主题域1"],
+    "valence": 0.7,
+    "arousal": 0.4,
+    "tags": ["核心词1", "核心词2", "扩展词1"],
+    "importance": 5,
+    "preserve_raw": false,
+    "is_pattern": false
+  }
+]""",
+    """输出格式（纯 JSON 对象）：
+{
+  "memories": [
+    {
+      "name": "条目标题（10字以内）",
+      "content": "整理后的内容",
+      "domain": ["主题域1"],
+      "valence": 0.7,
+      "arousal": 0.4,
+      "tags": ["核心词1", "核心词2", "扩展词1"],
+      "importance": 5,
+      "preserve_raw": false,
+      "is_pattern": false
+    }
+  ]
+}
+只返回上述 JSON 对象；禁止解释文字、Markdown code fence、前缀或后缀文本。""",
+)
+
 
 # ============================================================
 # Import Engine — core processing logic
@@ -1338,7 +1376,19 @@ class ImportEngine:
         # 称呼属于用户数据，不能拼进 system prompt；作为 JSON 数据字段传递，
         # 即使旧配置含换行或控制字符，也只能处于不可信记录边界内。
         _human = str(self.config.get("human") or "用户").strip()[:20] or "用户"
-        prompt = IMPORT_EXTRACT_PROMPT
+        json_output_enabled = (
+            getattr(self.dehydrator, "api_format", "") == "openai_compat"
+            and endpoint_hostname(getattr(self.dehydrator, "base_url", ""))
+            == "api.deepseek.com"
+            and str(getattr(self.dehydrator, "model", ""))
+            .lower()
+            .startswith("deepseek-v4")
+        )
+        prompt = (
+            IMPORT_EXTRACT_JSON_OBJECT_PROMPT
+            if json_output_enabled
+            else IMPORT_EXTRACT_PROMPT
+        )
 
         total_tokens = count_tokens_approx(chunk_content)
         if total_tokens > _EXTRACT_TOKEN_CEILING:
@@ -1364,11 +1414,19 @@ class ImportEngine:
             separators=(",", ":"),
         )
 
+        json_output_options = {}
+        if json_output_enabled:
+            json_output_options = {
+                "response_format": {"type": "json_object"},
+                "request_extra_body": {"thinking": {"type": "disabled"}},
+            }
+
         raw = await self.dehydrator._chat(
             prompt,
             data_record,
             max_tokens=_EXTRACT_MAX_TOKENS,
             temperature=_EXTRACT_TEMPERATURE,
+            **json_output_options,
         )
 
         if not raw.strip():
@@ -1394,6 +1452,13 @@ class ImportEngine:
                 hashlib.sha256(raw.encode("utf-8")).hexdigest(),
             )
             raise ValueError("LLM extraction returned invalid JSON") from exc
+
+        if isinstance(items, dict):
+            if "memories" not in items:
+                raise ValueError(
+                    "LLM extraction JSON object must contain a memories array"
+                )
+            items = items["memories"]
 
         if not isinstance(items, list):
             raise ValueError("LLM extraction result must be a JSON array")

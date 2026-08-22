@@ -464,6 +464,8 @@ class Dehydrator:
         *,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        response_format: dict | None = None,
+        request_extra_body: dict | None = None,
     ) -> str:
         """统一 chat 入口：对 429 / 5xx / 超时等瞬时错误做指数退避重试。
 
@@ -473,7 +475,12 @@ class Dehydrator:
         for attempt in range(_RETRY_MAX_ATTEMPTS):
             try:
                 return await self._chat_once(
-                    system, user, max_tokens=max_tokens, temperature=temperature
+                    system,
+                    user,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    response_format=response_format,
+                    request_extra_body=request_extra_body,
                 )
             except Exception as e:
                 if not self._is_transient_error(e) or attempt == _RETRY_MAX_ATTEMPTS - 1:
@@ -496,6 +503,8 @@ class Dehydrator:
         *,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        response_format: dict | None = None,
+        request_extra_body: dict | None = None,
     ) -> str:
         """统一的 OpenAI-compatible chat 调用。
 
@@ -523,6 +532,12 @@ class Dehydrator:
         # openai_compat (default)
         if self.client is None:
             return ""
+        extra_body = dict(self.extra_body)
+        if request_extra_body:
+            extra_body.update(request_extra_body)
+        response_format_arg = (
+            {"response_format": response_format} if response_format is not None else {}
+        )
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
@@ -530,7 +545,8 @@ class Dehydrator:
                 {"role": "user", "content": user},
             ],
             temperature=temperature if temperature is not None else self.temperature,
-            extra_body=self.extra_body or None,
+            extra_body=extra_body or None,
+            **response_format_arg,
             **chat_completion_token_limit(
                 self.model,
                 max_tokens if max_tokens is not None else self.max_tokens,
