@@ -9,7 +9,6 @@ from import_memory import (
     IMPORT_EXTRACT_JSON_OBJECT_PROMPT,
     IMPORT_EXTRACT_PROMPT,
     ImportEngine,
-    _DEEPSEEK_V4_THINKING_MAX_TOKENS,
     _EXTRACT_MAX_ITEMS,
     _EXTRACT_MAX_TOKENS,
 )
@@ -103,10 +102,7 @@ async def test_deepseek_extraction_uses_json_output_and_enables_thinking(tmp_pat
     assert captured["kwargs"]["request_extra_body"] == {
         "thinking": {"type": "enabled"}
     }
-    assert (
-        captured["kwargs"]["max_tokens"]
-        == _DEEPSEEK_V4_THINKING_MAX_TOKENS
-    )
+    assert captured["kwargs"]["max_tokens"] == 8192
     assert "禁止解释文字、Markdown code fence、前缀或后缀文本" in captured["prompt"]
 
 
