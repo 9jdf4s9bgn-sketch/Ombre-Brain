@@ -516,7 +516,27 @@ class Dehydrator:
         )
         if not response.choices:
             return ""
-        return response.choices[0].message.content or ""
+        choice = response.choices[0]
+        message = choice.message
+        content = message.content or ""
+        thinking_config = extra_body.get("thinking")
+        if (
+            isinstance(thinking_config, dict)
+            and thinking_config.get("type") == "enabled"
+        ):
+            reasoning_content = getattr(message, "reasoning_content", "") or ""
+            usage = getattr(response, "usage", None)
+            logger.info(
+                "Thinking response metadata: finish_reason=%s "
+                "reasoning_chars=%s content_chars=%s "
+                "completion_tokens=%s total_tokens=%s",
+                getattr(choice, "finish_reason", None),
+                len(reasoning_content),
+                len(content),
+                getattr(usage, "completion_tokens", None),
+                getattr(usage, "total_tokens", None),
+            )
+        return content
 
     async def _chat_gemini(
         self,

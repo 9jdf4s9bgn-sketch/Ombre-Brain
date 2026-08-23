@@ -68,6 +68,7 @@ _CHUNK_ERR_PREVIEW = 200       # 单 chunk 错误信息截断长度
 # 悄悄丢失长对话的尾部。
 _EXTRACT_TOKEN_CEILING = _CHUNK_TARGET_TOKENS
 _EXTRACT_MAX_TOKENS = 2048
+_DEEPSEEK_V4_THINKING_MAX_TOKENS = 4096
 _EXTRACT_MAX_ITEMS = 5         # 提示词之外再做强制写入上限
 _EXTRACT_TEMPERATURE = 0.0     # 提取需确定性
 _PARSE_ERR_PREVIEW = 200       # JSON 解析失败时日志预览
@@ -1326,10 +1327,16 @@ class ImportEngine:
                 "request_extra_body": {"thinking": {"type": "enabled"}},
             }
 
+        extract_max_tokens = (
+            _DEEPSEEK_V4_THINKING_MAX_TOKENS
+            if json_output_enabled
+            else _EXTRACT_MAX_TOKENS
+        )
+
         raw = await self.dehydrator._chat(
             prompt,
             data_record,
-            max_tokens=_EXTRACT_MAX_TOKENS,
+            max_tokens=extract_max_tokens,
             temperature=_EXTRACT_TEMPERATURE,
             **json_output_options,
         )

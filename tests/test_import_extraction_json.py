@@ -1,4 +1,5 @@
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -6,8 +7,11 @@ import pytest
 from dehydrator import Dehydrator
 from import_memory import (
     IMPORT_EXTRACT_JSON_OBJECT_PROMPT,
+    IMPORT_EXTRACT_PROMPT,
     ImportEngine,
+    _DEEPSEEK_V4_THINKING_MAX_TOKENS,
     _EXTRACT_MAX_ITEMS,
+    _EXTRACT_MAX_TOKENS,
 )
 
 
@@ -99,11 +103,44 @@ async def test_deepseek_extraction_uses_json_output_and_enables_thinking(tmp_pat
     assert captured["kwargs"]["request_extra_body"] == {
         "thinking": {"type": "enabled"}
     }
+    assert (
+        captured["kwargs"]["max_tokens"]
+        == _DEEPSEEK_V4_THINKING_MAX_TOKENS
+    )
     assert "禁止解释文字、Markdown code fence、前缀或后缀文本" in captured["prompt"]
 
 
 @pytest.mark.asyncio
-async def test_openai_compat_forwards_per_request_json_output_options(tmp_path):
+async def test_non_official_deepseek_keeps_legacy_extraction_budget(tmp_path):
+    captured = {}
+
+    class RelayDehydrator:
+        api_available = True
+        api_format = "openai_compat"
+        base_url = "https://api.gemai.cc/v1"
+        model = "deepseek-v4-pro"
+
+        async def _chat(self, prompt, content, **kwargs):
+            captured.update(prompt=prompt, content=content, kwargs=kwargs)
+            return "[]"
+
+    engine = ImportEngine(
+        {"buckets_dir": str(tmp_path), "human": "用户"},
+        bucket_mgr=None,
+        dehydrator=RelayDehydrator(),
+    )
+
+    assert await engine._extract_memories("用户：测试") == []
+    assert captured["prompt"] == IMPORT_EXTRACT_PROMPT
+    assert captured["kwargs"]["max_tokens"] == _EXTRACT_MAX_TOKENS
+    assert "response_format" not in captured["kwargs"]
+    assert "request_extra_body" not in captured["kwargs"]
+
+
+@pytest.mark.asyncio
+async def test_openai_compat_logs_safe_thinking_response_metadata(
+    tmp_path, caplog
+):
     dehydrator = Dehydrator(
         {
             "buckets_dir": str(tmp_path),
@@ -119,27 +156,47 @@ async def test_openai_compat_forwards_per_request_json_output_options(tmp_path):
         async def create(self, **kwargs):
             captured.update(kwargs)
             return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))]
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="length",
+                        message=SimpleNamespace(
+                            content="{}",
+                            reasoning_content="internal reasoning",
+                        ),
+                    )
+                ],
+                usage=SimpleNamespace(
+                    completion_tokens=4096,
+                    total_tokens=5000,
+                ),
             )
 
     dehydrator.client = SimpleNamespace(
         chat=SimpleNamespace(completions=Completions())
     )
     try:
-        await dehydrator._chat_once(
-            "system",
-            "user",
-            response_format={"type": "json_object"},
-            request_extra_body={"thinking": {"type": "disabled"}},
-        )
+        with caplog.at_level(logging.INFO, logger="ombre_brain.dehydrator"):
+            content = await dehydrator._chat_once(
+                "system",
+                "user",
+                response_format={"type": "json_object"},
+                request_extra_body={"thinking": {"type": "enabled"}},
+            )
     finally:
         dehydrator.close()
 
+    assert content == "{}"
     assert captured["response_format"] == {"type": "json_object"}
     assert captured["extra_body"] == {
         "existing": True,
-        "thinking": {"type": "disabled"},
+        "thinking": {"type": "enabled"},
     }
+    assert "finish_reason=length" in caplog.text
+    assert "reasoning_chars=18" in caplog.text
+    assert "content_chars=2" in caplog.text
+    assert "completion_tokens=4096" in caplog.text
+    assert "total_tokens=5000" in caplog.text
+    assert "internal reasoning" not in caplog.text
 
 
 @pytest.mark.parametrize("raw", ["not json", '{"content":"not an array"}'])
