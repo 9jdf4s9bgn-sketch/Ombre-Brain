@@ -5,6 +5,8 @@ import pytest
 
 from dehydrator import Dehydrator
 from import_memory import (
+    DEEPSEEK_V4_ATTRIBUTION_BOUNDARY_RULES,
+    IMPORT_EXTRACT_PROMPT,
     IMPORT_EXTRACT_JSON_OBJECT_PROMPT,
     ImportEngine,
     _EXTRACT_MAX_ITEMS,
@@ -73,6 +75,20 @@ def test_import_extraction_rejects_invalid_json():
         ImportEngine._parse_extraction('{"memories":[')
 
 
+def test_deepseek_prompt_adds_attribution_boundary_without_changing_legacy_prompt():
+    assert DEEPSEEK_V4_ATTRIBUTION_BOUNDARY_RULES in (
+        IMPORT_EXTRACT_JSON_OBJECT_PROMPT
+    )
+    assert DEEPSEEK_V4_ATTRIBUTION_BOUNDARY_RULES not in IMPORT_EXTRACT_PROMPT
+    assert "不得删除限定后改写成事实" in IMPORT_EXTRACT_JSON_OBJECT_PROMPT
+    assert "禁止把被否认或纠正的命题写成事实" in (
+        IMPORT_EXTRACT_JSON_OBJECT_PROMPT
+    )
+    assert "禁止从一次互动泛化出长期稳定的关系属性" in (
+        IMPORT_EXTRACT_JSON_OBJECT_PROMPT
+    )
+
+
 @pytest.mark.asyncio
 async def test_deepseek_extraction_uses_json_output_and_disables_thinking(tmp_path):
     captured = {}
@@ -100,6 +116,45 @@ async def test_deepseek_extraction_uses_json_output_and_disables_thinking(tmp_pa
         "thinking": {"type": "disabled"}
     }
     assert "禁止解释文字、Markdown code fence、前缀或后缀文本" in captured["prompt"]
+    assert "不得删除限定后改写成事实" in captured["prompt"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("api_format", "base_url", "model"),
+    [
+        ("openai_compat", "https://api.deepseek.com.evil/v1", "deepseek-v4-pro"),
+        ("openai_compat", "https://api.deepseek.com/v1", "deepseek-v3"),
+        ("openai_compat", "https://api.gemai.cc/v1", "deepseek-v4-pro"),
+        ("anthropic", "https://api.deepseek.com/v1", "deepseek-v4-pro"),
+    ],
+)
+async def test_attribution_prompt_is_scoped_to_official_deepseek_v4(
+    tmp_path, api_format, base_url, model
+):
+    captured = {}
+
+    class OtherDehydrator:
+        api_available = True
+
+        async def _chat(self, prompt, content, **kwargs):
+            captured.update(prompt=prompt, content=content, kwargs=kwargs)
+            return "[]"
+
+    dehydrator = OtherDehydrator()
+    dehydrator.api_format = api_format
+    dehydrator.base_url = base_url
+    dehydrator.model = model
+    engine = ImportEngine(
+        {"buckets_dir": str(tmp_path), "human": "用户"},
+        bucket_mgr=None,
+        dehydrator=dehydrator,
+    )
+
+    assert await engine._extract_memories("用户：测试") == []
+    assert captured["prompt"] == IMPORT_EXTRACT_PROMPT
+    assert "response_format" not in captured["kwargs"]
+    assert "request_extra_body" not in captured["kwargs"]
 
 
 @pytest.mark.asyncio
