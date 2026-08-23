@@ -1323,7 +1323,7 @@ class ImportEngine:
         if json_output_enabled:
             json_output_options = {
                 "response_format": {"type": "json_object"},
-                "request_extra_body": {"thinking": {"type": "disabled"}},
+                "request_extra_body": {"thinking": {"type": "enabled"}},
             }
 
         raw = await self.dehydrator._chat(

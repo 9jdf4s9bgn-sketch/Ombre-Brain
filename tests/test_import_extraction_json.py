@@ -74,7 +74,7 @@ def test_import_extraction_rejects_invalid_json():
 
 
 @pytest.mark.asyncio
-async def test_deepseek_extraction_uses_json_output_and_disables_thinking(tmp_path):
+async def test_deepseek_extraction_uses_json_output_and_enables_thinking(tmp_path):
     captured = {}
 
     class DeepSeekDehydrator:
@@ -97,7 +97,7 @@ async def test_deepseek_extraction_uses_json_output_and_disables_thinking(tmp_pa
     assert captured["prompt"] == IMPORT_EXTRACT_JSON_OBJECT_PROMPT
     assert captured["kwargs"]["response_format"] == {"type": "json_object"}
     assert captured["kwargs"]["request_extra_body"] == {
-        "thinking": {"type": "disabled"}
+        "thinking": {"type": "enabled"}
     }
     assert "禁止解释文字、Markdown code fence、前缀或后缀文本" in captured["prompt"]
 
