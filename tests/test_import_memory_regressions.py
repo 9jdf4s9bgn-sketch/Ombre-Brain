@@ -8,7 +8,6 @@
    的目标预算（对英文/混合内容而言），且不留任何痕迹。
 4. ImportState.save() 无 fsync/长路径前缀（见 utils.atomic_write_text 用法）。
 """
-import hashlib
 import json
 import os
 from unittest.mock import MagicMock
@@ -19,8 +18,10 @@ from import_memory import (
     ImportEngine,
     ImportState,
     _EXTRACT_TOKEN_CEILING,
+    _source_hash,
     _safe_import_error_detail,
     chunk_turns,
+    detect_and_parse,
     diagnose_import_errors,
 )
 from tools import _runtime as rt
@@ -291,6 +292,168 @@ def test_many_short_turns_stay_within_declared_chunk_budget():
     assert reconstructed == "\n".join("[AI] ." for _turn in turns)
 
 
+def test_echo_markdown_preserves_speaker_role_sequence_timestamp_and_content():
+    raw = """# 候选原件
+
+来源：测试
+
+16218｜2026-07-28 21:38:03.035 +08:00｜松松｜\\
+第一条原文
+
+16219｜2026-07-28 21:38:09.268 +08:00｜尼奥｜\\
+第二条原文
+继续同一条
+"""
+
+    turns = detect_and_parse(
+        raw,
+        filename="echo.md",
+        human_label="松松",
+        ai_label="尼奥",
+    )
+
+    assert turns == [
+        {
+            "role": "user",
+            "speaker": "松松",
+            "sequence": 16218,
+            "content": "第一条原文",
+            "timestamp": "2026-07-28 21:38:03.035 +08:00",
+        },
+        {
+            "role": "assistant",
+            "speaker": "尼奥",
+            "sequence": 16219,
+            "content": "第二条原文\n继续同一条",
+            "timestamp": "2026-07-28 21:38:09.268 +08:00",
+        },
+    ]
+    assert [turn["sequence"] for turn in turns] == [16218, 16219]
+
+    chunks = chunk_turns(turns, human_label="松松")
+    evidence = chunks[0]["content"]
+    assert (
+        '[sequence=16218 timestamp="2026-07-28 21:38:03.035 +08:00" '
+        'role=user speaker="松松"] 第一条原文'
+    ) in evidence
+    assert (
+        '[sequence=16219 timestamp="2026-07-28 21:38:09.268 +08:00" '
+        'role=assistant speaker="尼奥"] 第二条原文\n继续同一条'
+    ) in evidence
+    assert "# 候选原件" not in evidence
+    assert "来源：测试" not in evidence
+
+
+def test_echo_markdown_unknown_speaker_is_preserved_without_role_guessing():
+    raw = """1｜2026-07-28 21:38:03.035 +08:00｜第三方｜\\
+第三方原文
+"""
+
+    turns = detect_and_parse(
+        raw,
+        filename="echo.md",
+        human_label="松松",
+        ai_label="尼奥",
+    )
+
+    assert turns[0]["speaker"] == "第三方"
+    assert turns[0]["role"] == "unknown"
+    assert 'role=unknown speaker="第三方"' in chunk_turns(turns)[0]["content"]
+
+
+def test_echo_markdown_preserves_sequence_gaps_without_repairing_them():
+    raw = """7｜2026-07-28 21:38:03.035 +08:00｜松松｜\\
+第一条
+
+9｜2026-07-28 21:38:09.268 +08:00｜尼奥｜\\
+第二条
+"""
+
+    turns = detect_and_parse(
+        raw,
+        filename="echo.md",
+        human_label="松松",
+        ai_label="尼奥",
+    )
+
+    assert [turn["sequence"] for turn in turns] == [7, 9]
+
+
+def test_legacy_markdown_role_fallback_is_unchanged():
+    turns = detect_and_parse(
+        "Human: 你好\nAssistant: 你好呀",
+        filename="legacy.md",
+        human_label="松松",
+        ai_label="尼奥",
+    )
+
+    assert turns == [
+        {"role": "user", "content": "你好", "timestamp": ""},
+        {"role": "assistant", "content": "你好呀", "timestamp": ""},
+    ]
+    assert chunk_turns(turns, human_label="松松")[0]["content"] == (
+        "[松松] 你好\n[AI] 你好呀"
+    )
+
+
+def test_claude_and_chatgpt_json_role_parsing_remains_compatible():
+    claude_raw = json.dumps({
+        "chat_messages": [
+            {"sender": "human", "text": "Claude 用户消息", "created_at": "1"},
+            {"sender": "assistant", "text": "Claude AI 消息", "created_at": "2"},
+        ]
+    })
+    chatgpt_raw = json.dumps({
+        "mapping": {
+            "user": {
+                "message": {
+                    "author": {"role": "user"},
+                    "content": {"parts": ["ChatGPT 用户消息"]},
+                    "create_time": 1,
+                }
+            },
+            "assistant": {
+                "message": {
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["ChatGPT AI 消息"]},
+                    "create_time": 2,
+                }
+            },
+        }
+    })
+
+    claude_turns = detect_and_parse(
+        claude_raw,
+        filename="claude.json",
+        human_label="松松",
+        ai_label="尼奥",
+    )
+    chatgpt_turns = detect_and_parse(
+        chatgpt_raw,
+        filename="chatgpt.json",
+        human_label="松松",
+        ai_label="尼奥",
+    )
+
+    assert [turn["role"] for turn in claude_turns] == ["human", "assistant"]
+    assert [turn["content"] for turn in claude_turns] == [
+        "Claude 用户消息",
+        "Claude AI 消息",
+    ]
+    assert [turn["role"] for turn in chatgpt_turns] == ["user", "assistant"]
+    assert [turn["content"] for turn in chatgpt_turns] == [
+        "ChatGPT 用户消息",
+        "ChatGPT AI 消息",
+    ]
+    assert all("speaker" not in turn for turn in claude_turns + chatgpt_turns)
+
+
+def test_source_hash_changes_when_ai_identity_changes():
+    raw = "Human: 你好\nAssistant: 你好呀"
+
+    assert _source_hash("松松", "尼奥", raw) != _source_hash("松松", "其他AI", raw)
+
+
 def test_chunk_turns_rejects_non_positive_budget():
     with pytest.raises(ValueError, match="正数"):
         chunk_turns([], target_tokens=0)
@@ -377,6 +540,8 @@ async def test_import_preflight_failure_replaces_stale_status(tmp_path):
 async def test_resume_with_changed_human_label_starts_fresh_not_misaligned(tmp_path, monkeypatch):
     import import_memory as im
 
+    monkeypatch.delenv("AI_NAME", raising=False)
+
     def fake_chunk_turns(turns, target_tokens=10000, human_label="用户"):
         # chunk 数量跟 human_label 挂钩，模拟「换了称呼、边界跟着变」。
         return [
@@ -393,7 +558,7 @@ async def test_resume_with_changed_human_label_starts_fresh_not_misaligned(tmp_p
     engine = ImportEngine(config, bucket_mgr, dehydrator)
 
     raw = "Human: 你好\nAssistant: 你好呀"
-    old_hash = hashlib.sha256(f"阿明\x00{raw}".encode()).hexdigest()[:16]
+    old_hash = _source_hash("阿明", "AI", raw)
     # 手动摆出「已经处理完 1/2 个 chunk，暂停」的状态——不通过 start() 生成，
     # 避免它一口气把两个 chunk 都处理完导致 can_resume 判定失效。
     engine.state.reset("f.md", old_hash, total_chunks=2)
@@ -403,7 +568,7 @@ async def test_resume_with_changed_human_label_starts_fresh_not_misaligned(tmp_p
 
     # 暂停期间 human 从「阿明」（2 字）改成「小美帮手」（4 字）
     config["human"] = "小美帮手"
-    new_hash = hashlib.sha256(f"小美帮手\x00{raw}".encode()).hexdigest()[:16]
+    new_hash = _source_hash("小美帮手", "AI", raw)
 
     result = await engine.start(raw, filename="f.md", resume=True)
 

@@ -40,7 +40,14 @@ from tools._common import (
     enforce_high_importance_quota,
 )
 from ombrebrain.integrations.provider_detect import endpoint_hostname
-from utils import atomic_write_text, clean_llm_json, count_tokens_approx, now_iso, parse_bool
+from utils import (
+    atomic_write_text,
+    clean_llm_json,
+    count_tokens_approx,
+    get_ai_name,
+    now_iso,
+    parse_bool,
+)
 
 logger = logging.getLogger("ombre_brain.import")
 
@@ -61,6 +68,7 @@ _STATE_HASH_HEX = 16           # source_hash 取 sha256 前 16 hex
 _JOB_ID_HEX = 16               # import job id：仅用于并发预留与状态关联
 _STATE_ERR_LOG_MAX = 100       # errors 数组最多保留条数（避免状态文件肨胀）
 _CHUNK_ERR_PREVIEW = 200       # 单 chunk 错误信息截断长度
+_IMPORT_PARSER_VERSION = "speaker-role-v1"
 
 # --- _extract_memories LLM 调用 ---
 # chunk_turns() 必须保证每块都不超过该上限；_extract_memories() 只做防御性
@@ -199,11 +207,15 @@ def _timestamp_text(value: object) -> str:
     return str(value or "")
 
 
-def _source_hash(human_label: str, raw_content: str) -> str:
+def _source_hash(human_label: str, ai_label: str, raw_content: str) -> str:
     """Hash a large import incrementally instead of creating string/bytes twins."""
 
     digest = hashlib.sha256()
+    digest.update(_IMPORT_PARSER_VERSION.encode("utf-8"))
+    digest.update(b"\x00")
     digest.update(human_label.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(ai_label.encode("utf-8"))
     digest.update(b"\x00")
     for start in range(0, len(raw_content), _TEXT_HASH_CHUNK_CHARS):
         digest.update(
@@ -216,11 +228,17 @@ def _prepare_import(
     raw_content: str,
     filename: str,
     human_label: str,
+    ai_label: str,
 ) -> tuple[str, int, list[dict]]:
     """CPU/memory-heavy parsing entry point run outside the event loop."""
 
-    source_hash = _source_hash(human_label, raw_content)
-    turns = detect_and_parse(raw_content, filename)
+    source_hash = _source_hash(human_label, ai_label, raw_content)
+    turns = detect_and_parse(
+        raw_content,
+        filename,
+        human_label=human_label,
+        ai_label=ai_label,
+    )
     turns_count = len(turns)
     chunks = chunk_turns(turns, human_label=human_label) if turns else []
     turns.clear()
@@ -365,10 +383,62 @@ def _parse_chatgpt_json(data: list | dict) -> list[dict]:
     return turns
 
 
-def _parse_markdown(text: str) -> list[dict]:
+_ECHO_MESSAGE_HEADER_RE = re.compile(
+    r"^(?P<sequence>\d+)｜(?P<timestamp>[^｜\r\n]+)｜"
+    r"(?P<speaker>[^｜\r\n]+)｜(?:\\)?\s*$"
+)
+
+
+def _parse_markdown(
+    text: str,
+    *,
+    human_label: str = "用户",
+    ai_label: str = "AI",
+) -> list[dict]:
     """Parse Markdown/plain text → [{role, content, timestamp}, ...]"""
-    # Try to detect conversation patterns
     lines = text.split("\n")
+    echo_headers = [
+        (index, match)
+        for index, line in enumerate(lines)
+        if (match := _ECHO_MESSAGE_HEADER_RE.match(line.strip()))
+    ]
+    if echo_headers:
+        turns = []
+        human_key = human_label.strip().casefold()
+        ai_key = ai_label.strip().casefold()
+        for header_index, (line_index, match) in enumerate(echo_headers):
+            next_index = (
+                echo_headers[header_index + 1][0]
+                if header_index + 1 < len(echo_headers)
+                else len(lines)
+            )
+            content_lines = lines[line_index + 1:next_index]
+            while content_lines and not content_lines[0].strip():
+                content_lines.pop(0)
+            while content_lines and not content_lines[-1].strip():
+                content_lines.pop()
+            content = "\n".join(content_lines)
+            if not content.strip():
+                continue
+
+            speaker = match.group("speaker").strip()
+            speaker_key = speaker.casefold()
+            if speaker_key == human_key:
+                role = "user"
+            elif speaker_key == ai_key:
+                role = "assistant"
+            else:
+                role = "unknown"
+            turns.append({
+                "role": role,
+                "speaker": speaker,
+                "sequence": int(match.group("sequence")),
+                "content": content,
+                "timestamp": match.group("timestamp").strip(),
+            })
+        return turns
+
+    # Try to detect conversation patterns
     turns = []
     current_role = "user"
     current_content: list[str] = []
@@ -403,7 +473,13 @@ def _parse_markdown(text: str) -> list[dict]:
     return turns
 
 
-def detect_and_parse(raw_content: str, filename: str = "") -> list[dict]:
+def detect_and_parse(
+    raw_content: str,
+    filename: str = "",
+    *,
+    human_label: str = "用户",
+    ai_label: str = "AI",
+) -> list[dict]:
     """
     Auto-detect format and parse to normalized turns.
     自动检测格式并解析为标准化的对话轮次。
@@ -448,7 +524,11 @@ def detect_and_parse(raw_content: str, filename: str = "") -> list[dict]:
             pass
 
     # Fall back to markdown/text
-    return _parse_markdown(raw_content)
+    return _parse_markdown(
+        raw_content,
+        human_label=human_label,
+        ai_label=ai_label,
+    )
 
 
 # ============================================================
@@ -527,8 +607,26 @@ def chunk_turns(turns: list[dict], target_tokens: int = _CHUNK_TARGET_TOKENS, hu
     turn_count = 0
 
     for turn in turns:
-        role_label = human_label if turn["role"] in ("user", "human") else "AI"
-        line_prefix = f"[{role_label}] "
+        speaker = str(turn.get("speaker", "")).strip()
+        if speaker:
+            evidence_fields = []
+            if turn.get("sequence") is not None:
+                evidence_fields.append(f"sequence={turn['sequence']}")
+            timestamp = str(turn.get("timestamp", "")).strip()
+            if timestamp:
+                evidence_fields.append(
+                    f"timestamp={json.dumps(timestamp, ensure_ascii=False)}"
+                )
+            evidence_fields.append(f"role={turn.get('role', 'unknown')}")
+            evidence_fields.append(
+                f"speaker={json.dumps(speaker, ensure_ascii=False)}"
+            )
+            line_prefix = f"[{' '.join(evidence_fields)}] "
+        else:
+            role_label = (
+                human_label if turn["role"] in ("user", "human") else "AI"
+            )
+            line_prefix = f"[{role_label}] "
         turn_content = str(turn.get("content", ""))
         line = line_prefix + turn_content
         line_tokens = count_tokens_approx(line)
@@ -624,7 +722,12 @@ def _detect_preview_format(raw_content: str, filename: str, warnings: list[str])
     return "markdown" if "\n" in raw_content else "text"
 
 
-def preview_import(raw_content: str, filename: str = "", human_label: str = "用户") -> dict[str, Any]:
+def preview_import(
+    raw_content: str,
+    filename: str = "",
+    human_label: str = "用户",
+    ai_label: str | None = None,
+) -> dict[str, Any]:
     """Return a local-only preview of an import file without mutating state."""
     warnings: list[str] = []
     if not raw_content or not _has_non_whitespace(raw_content):
@@ -639,7 +742,13 @@ def preview_import(raw_content: str, filename: str = "", human_label: str = "用
         }
 
     detected_format = _detect_preview_format(raw_content, filename, warnings)
-    turns = detect_and_parse(raw_content, filename)
+    resolved_ai_label = ai_label or get_ai_name()
+    turns = detect_and_parse(
+        raw_content,
+        filename,
+        human_label=human_label,
+        ai_label=resolved_ai_label,
+    )
     if not turns:
         return {
             "ok": False,
@@ -994,9 +1103,10 @@ class ImportEngine:
                 )
 
             _human = self.config.get("human", "用户")
-            # source_hash 必须把 human_label 也算进去：chunk_turns() 把它拼进每一行
-            # 再数 token，边界完全由它决定。只按 raw_content 算哈希的话，暂停期间
-            # config.yaml 的 human 字段被改过，恢复时会重新切出一份不同的 chunk
+            _ai = get_ai_name()
+            # source_hash 必须把 parser 版本和双方显示名都算进去：它们会影响解析、
+            # 行前缀和 token 边界。否则暂停期间身份配置或 parser 改变后，恢复任务
+            # 会复用一份边界已经不同的旧进度。
             # 列表，但 state.data["processed"] 原样复用——要么跳过内容，要么用
             # 错位的切片重复处理。哈希带上 human_label 后，这种情况会被下面的
             # "source_hash 不一致" 分支识别为「源变了」，走全新导入而不是错位续传。
@@ -1007,6 +1117,7 @@ class ImportEngine:
                 raw_content,
                 filename,
                 str(_human),
+                _ai,
             )
             raw_content = ""
 
