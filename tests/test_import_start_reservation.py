@@ -49,9 +49,14 @@ class ImmediateDehydrator:
 class BodyRequest:
     headers = {}
 
-    def __init__(self, body: str, filename: str = "upload.md"):
+    def __init__(
+        self,
+        body: str,
+        filename: str = "upload.md",
+        **query_params,
+    ):
         self._body = body.encode("utf-8")
-        self.query_params = {"filename": filename}
+        self.query_params = {"filename": filename, **query_params}
 
     async def body(self):
         return self._body
@@ -163,6 +168,85 @@ async def test_upload_toctou_returns_one_started_and_one_409(tmp_path, monkeypat
     assert status["source_file"] == started_payload["filename"]
     assert status["source_file"] == first_request.query_params["filename"]
     assert status["source_file"] != second_request.query_params["filename"]
+
+
+@pytest.mark.asyncio
+async def test_upload_passes_identity_mapping_to_background_source_hash(
+    tmp_path,
+    monkeypatch,
+):
+    engine = ImportEngine(
+        {"buckets_dir": str(tmp_path), "human": "人类"},
+        object(),
+        ImmediateDehydrator(),
+    )
+    monkeypatch.setattr(import_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(import_api.sh, "import_engine", engine, raising=False)
+    monkeypatch.setattr(import_api.sh, "config", {"human": "人类"}, raising=False)
+
+    raw = """1｜2026-08-25 10:00:00.000 +08:00｜松松｜\\
+你好
+
+2｜2026-08-25 10:00:01.000 +08:00｜尼奥｜\\
+你好呀
+"""
+    mcp = FakeMCP()
+    import_api.register(mcp)
+    response = await mcp.routes[("POST", "/api/import/upload")](
+        BodyRequest(
+            raw,
+            filename="echo.md",
+            human_label="松松",
+            assistant_label="尼奥",
+        )
+    )
+
+    assert response.status_code == 200
+    await _wait_until_finished(engine)
+    assert engine.get_status()["status"] == "completed"
+    assert engine.state.data["source_hash"] == import_memory_module._source_hash(
+        "松松",
+        "尼奥",
+        raw,
+    )
+    assert engine.is_running is False
+    assert engine.active_job_id == ""
+
+
+@pytest.mark.asyncio
+async def test_invalid_identity_mapping_releases_upload_reservation(
+    tmp_path,
+    monkeypatch,
+):
+    engine = ImportEngine(
+        {"buckets_dir": str(tmp_path), "human": "人类"},
+        object(),
+        ImmediateDehydrator(),
+    )
+    monkeypatch.setattr(import_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(import_api.sh, "import_engine", engine, raising=False)
+    monkeypatch.setattr(import_api.sh, "config", {"human": "人类"}, raising=False)
+    raw = "1｜2026-08-25 10:00:00.000 +08:00｜松松｜\\\n你好"
+    mcp = FakeMCP()
+    import_api.register(mcp)
+    upload = mcp.routes[("POST", "/api/import/upload")]
+
+    rejected = await upload(
+        BodyRequest(raw, human_label="同名", assistant_label="同名")
+    )
+
+    assert rejected.status_code == 400
+    assert engine.is_running is False
+    assert engine.active_job_id == ""
+
+    started = await upload(
+        BodyRequest(raw, human_label="松松", assistant_label="尼奥")
+    )
+    assert started.status_code == 200
+    await _wait_until_finished(engine)
+    assert engine.get_status()["status"] == "completed"
+    assert engine.is_running is False
+    assert engine.active_job_id == ""
 
 
 @pytest.mark.asyncio

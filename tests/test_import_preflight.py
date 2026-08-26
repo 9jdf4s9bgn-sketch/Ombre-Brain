@@ -21,9 +21,14 @@ class FakeMCP:
 
 
 class BodyRequest:
-    def __init__(self, body: str, filename: str = "upload.md"):
+    def __init__(
+        self,
+        body: str,
+        filename: str = "upload.md",
+        **query_params,
+    ):
         self.headers = {}
-        self.query_params = {"filename": filename}
+        self.query_params = {"filename": filename, **query_params}
         self._body = body.encode("utf-8")
 
     async def body(self):
@@ -132,6 +137,167 @@ async def test_import_preflight_route_returns_preview_with_runtime_readiness(mon
     assert payload["filename"] == "chat.md"
     assert payload["turns_count"] == 2
     assert payload["chunks_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_import_preflight_returns_resolved_echo_identity_snapshot(monkeypatch):
+    monkeypatch.setattr(import_api.sh, "_require_auth", lambda request: None)
+    monkeypatch.setattr(import_api.sh, "import_engine", FakeImportEngine())
+    monkeypatch.setattr(import_api.sh, "config", {"human": "人类"})
+
+    raw = """1｜2026-08-25 10:00:00.000 +08:00｜松松｜\\
+你好
+
+2｜2026-08-25 10:00:01.000 +08:00｜尼奥｜\\
+你好呀
+"""
+    mcp = FakeMCP()
+    import_api.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/import/preflight")](
+        BodyRequest(
+            raw,
+            filename="echo.md",
+            human_label=" 松松 ",
+            assistant_label=" 尼奥 ",
+        )
+    )
+    payload = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert payload["identity_mapping"] == {
+        "applied": True,
+        "human_label": "松松",
+        "assistant_label": "尼奥",
+    }
+    assert 'role=user speaker="松松"' in payload["first_chunk_preview"]
+    assert 'role=assistant speaker="尼奥"' in payload["first_chunk_preview"]
+
+
+@pytest.mark.asyncio
+async def test_import_preflight_echo_identity_uses_global_fallback(monkeypatch):
+    monkeypatch.setattr(import_api.sh, "_require_auth", lambda request: None)
+    monkeypatch.setattr(import_api.sh, "import_engine", FakeImportEngine())
+    monkeypatch.setattr(import_api.sh, "config", {"human": "人类"})
+    monkeypatch.setattr(import_api, "get_ai_name", lambda: "AI")
+
+    raw = """1｜2026-08-25 10:00:00.000 +08:00｜人类｜\\
+你好
+
+2｜2026-08-25 10:00:01.000 +08:00｜AI｜\\
+你好呀
+"""
+    mcp = FakeMCP()
+    import_api.register(mcp)
+    response = await mcp.routes[("POST", "/api/import/preflight")](
+        BodyRequest(raw, human_label="   ", assistant_label="")
+    )
+    payload = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert payload["identity_mapping"] == {
+        "applied": True,
+        "human_label": "人类",
+        "assistant_label": "AI",
+    }
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_roles"),
+    [
+        ("Human: 你好\nAssistant: 你好呀", ["user", "assistant"]),
+        (
+            json.dumps({
+                "chat_messages": [
+                    {"sender": "human", "text": "Claude 用户消息"},
+                    {"sender": "assistant", "text": "Claude AI 消息"},
+                ]
+            }),
+            ["human", "assistant"],
+        ),
+        (
+            json.dumps({
+                "mapping": {
+                    "user": {
+                        "message": {
+                            "author": {"role": "user"},
+                            "content": {"parts": ["ChatGPT 用户消息"]},
+                        }
+                    },
+                    "assistant": {
+                        "message": {
+                            "author": {"role": "assistant"},
+                            "content": {"parts": ["ChatGPT AI 消息"]},
+                        }
+                    }
+                }
+            }),
+            ["user", "assistant"],
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_import_preflight_ignores_echo_mapping_for_other_formats(
+    raw,
+    expected_roles,
+    monkeypatch,
+):
+    monkeypatch.setattr(import_api.sh, "_require_auth", lambda request: None)
+    monkeypatch.setattr(import_api.sh, "import_engine", FakeImportEngine())
+    monkeypatch.setattr(import_api.sh, "config", {"human": "人类"})
+    monkeypatch.setattr(import_api, "get_ai_name", lambda: "AI")
+
+    mcp = FakeMCP()
+    import_api.register(mcp)
+    response = await mcp.routes[("POST", "/api/import/preflight")](
+        BodyRequest(raw, human_label="松松", assistant_label="尼奥")
+    )
+    payload = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert payload["identity_mapping"] == {
+        "applied": False,
+        "human_label": "人类",
+        "assistant_label": "AI",
+    }
+    assert [turn["role"] for turn in payload["sample_turns"]] == expected_roles
+    assert "松松" not in payload["first_chunk_preview"]
+    assert "尼奥" not in payload["first_chunk_preview"]
+
+
+@pytest.mark.parametrize(
+    ("human_label", "assistant_label", "error"),
+    [
+        ("同名", "同名", "must be different"),
+        ("松\n松", "尼奥", "control characters"),
+        ("松" * 21, "尼奥", "at most 20"),
+        ("松松", "尼" * 41, "at most 40"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_import_preflight_validates_identity_query_parameters(
+    human_label,
+    assistant_label,
+    error,
+    monkeypatch,
+):
+    monkeypatch.setattr(import_api.sh, "_require_auth", lambda request: None)
+    monkeypatch.setattr(import_api.sh, "import_engine", FakeImportEngine())
+    monkeypatch.setattr(import_api.sh, "config", {"human": "人类"})
+
+    raw = "1｜2026-08-25 10:00:00.000 +08:00｜松松｜\\\n你好"
+    mcp = FakeMCP()
+    import_api.register(mcp)
+    response = await mcp.routes[("POST", "/api/import/preflight")](
+        BodyRequest(
+            raw,
+            human_label=human_label,
+            assistant_label=assistant_label,
+        )
+    )
+
+    assert response.status_code == 400
+    assert error in json.loads(response.body)["error"]
 
 
 @pytest.mark.asyncio

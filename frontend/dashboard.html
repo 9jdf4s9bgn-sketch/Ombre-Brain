@@ -2029,6 +2029,16 @@
       <input type="file" id="import-file-input" accept=".json,.txt,.md,.jsonl" style="display:none" />
     </div>
 
+    <div style="margin:12px 0;padding:12px 14px;background:var(--surface-solid);border-radius:8px;">
+      <div style="font-size:12px;color:var(--text-dim);line-height:1.6;margin-bottom:8px;">
+        仅用于 Echo Markdown 人物角色识别；留空使用当前全局称呼；不会修改 Dashboard 身份或已有记忆。
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;">
+        <div class="form-row" style="margin:0;"><label>Human speaker</label><input type="text" id="import-human-label" maxlength="20" autocomplete="off" /></div>
+        <div class="form-row" style="margin:0;"><label>Assistant speaker</label><input type="text" id="import-assistant-label" maxlength="40" autocomplete="off" /></div>
+      </div>
+    </div>
+
     <div style="margin:12px 0;">
       <div class="hw-toggle-row" style="gap:10px;align-items:center;">
         <span class="hw-switch" id="import-preserve-raw-sw" role="switch" aria-checked="false"
@@ -7948,6 +7958,8 @@ window.addEventListener('load', function() {
 const uploadZone = document.getElementById('import-upload-zone');
 const fileInput = document.getElementById('import-file-input');
 let pendingImportFile = null;
+let pendingImportSnapshot = null;
+let importPreflightGeneration = 0;
 
 uploadZone.addEventListener('click', () => fileInput.click());
 uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.style.borderColor = 'var(--accent)'; });
@@ -7984,6 +7996,9 @@ function renderImportPreflight(data) {
     + ' · 分块：<b>' + (data.chunks_count || 0) + '</b>'
     + ' · 预计 API 调用：<b>' + (data.estimated_api_calls || 0) + '</b>'
     + ' · 大小：<b>' + Math.round((data.size_bytes || 0) / 1024) + ' KB</b>'
+    + (data.identity_mapping && data.identity_mapping.applied
+      ? '<br>Echo identity：<b>' + esc(data.identity_mapping.human_label) + '</b> / <b>' + esc(data.identity_mapping.assistant_label) + '</b>'
+      : '')
     + (!data.llm_ready ? '<br><span style="color:var(--negative)">压缩/打标 LLM 未就绪，暂不能导入。</span>' : '')
     + (data.import_running ? '<br><span style="color:var(--negative)">已有导入任务运行中，请完成后再开始。</span>' : '');
   const warnings = data.warnings || [];
@@ -7999,7 +8014,12 @@ function renderImportPreflight(data) {
 }
 
 async function runImportPreflight(file) {
+  const requestGeneration = ++importPreflightGeneration;
+  const requestFile = file;
   pendingImportFile = file;
+  pendingImportSnapshot = null;
+  const humanLabel = (document.getElementById('import-human-label').value || '').trim();
+  const assistantLabel = (document.getElementById('import-assistant-label').value || '').trim();
   const panel = document.getElementById('import-preflight-panel');
   const summary = document.getElementById('import-preflight-summary');
   const btn = document.getElementById('import-start-confirm-btn');
@@ -8008,17 +8028,35 @@ async function runImportPreflight(file) {
   if (btn) btn.disabled = true;
   const fd = new FormData();
   fd.append('file', file);
+  const params = new URLSearchParams();
+  if (humanLabel) params.set('human_label', humanLabel);
+  if (assistantLabel) params.set('assistant_label', assistantLabel);
   try {
-    const res = await fetch(BASE + '/api/import/preflight', { method: 'POST', body: fd });
+    const query = params.toString();
+    const res = await fetch(BASE + '/api/import/preflight' + (query ? '?' + query : ''), { method: 'POST', body: fd });
     const data = await res.json();
+    if (requestGeneration !== importPreflightGeneration || pendingImportFile !== requestFile) return;
+    if (data.ok && data.identity_mapping) {
+      pendingImportSnapshot = {
+        generation: requestGeneration,
+        file: requestFile,
+        identity_mapping: {
+          human_label: data.identity_mapping.human_label || '',
+          assistant_label: data.identity_mapping.assistant_label || '',
+        },
+      };
+    }
     renderImportPreflight(data);
   } catch (e) {
+    if (requestGeneration !== importPreflightGeneration || pendingImportFile !== requestFile) return;
     renderImportPreflight({ ok: false, error: e.message || String(e), filename: file.name });
   }
 }
 
 function clearImportPreflight() {
+  importPreflightGeneration++;
   pendingImportFile = null;
+  pendingImportSnapshot = null;
   if (fileInput) fileInput.value = '';
   const panel = document.getElementById('import-preflight-panel');
   if (panel) panel.style.display = 'none';
@@ -8027,18 +8065,32 @@ function clearImportPreflight() {
 async function confirmStartImport() {
   if (!pendingImportFile) return;
   const file = pendingImportFile;
+  const snapshot = pendingImportSnapshot;
+  if (!snapshot || snapshot.generation !== importPreflightGeneration || snapshot.file !== file) {
+    const btn = document.getElementById('import-start-confirm-btn');
+    if (btn) btn.disabled = true;
+    alert('文件或预检快照已变化，请重新预检。');
+    return;
+  }
+  const identityMapping = snapshot.identity_mapping;
+  importPreflightGeneration++;
   pendingImportFile = null;
+  pendingImportSnapshot = null;
   const btn = document.getElementById('import-start-confirm-btn');
   if (btn) btn.disabled = true;
-  await startImport(file);
+  await startImport(file, identityMapping);
 }
 
-async function startImport(file) {
+async function startImport(file, identityMapping) {
   const preserveRaw = document.getElementById('import-preserve-raw').checked;
   const fd = new FormData();
   fd.append('file', file);
+  const params = new URLSearchParams();
+  params.set('preserve_raw', preserveRaw ? '1' : '0');
+  if (identityMapping && identityMapping.human_label) params.set('human_label', identityMapping.human_label);
+  if (identityMapping && identityMapping.assistant_label) params.set('assistant_label', identityMapping.assistant_label);
   try {
-    const res = await fetch(BASE + '/api/import/upload?preserve_raw=' + (preserveRaw ? '1' : '0'), { method: 'POST', body: fd });
+    const res = await fetch(BASE + '/api/import/upload?' + params.toString(), { method: 'POST', body: fd });
     const data = await res.json();
     if (data.error) { alert('导入失败: ' + data.error); return; }
     clearImportPreflight();

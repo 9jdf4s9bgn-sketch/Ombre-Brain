@@ -29,9 +29,9 @@ from starlette.responses import FileResponse, Response
 from . import _shared as sh
 
 try:
-    from utils import normalize_memory_title, parse_bool, sanitize_name  # type: ignore
+    from utils import get_ai_name, normalize_memory_title, parse_bool, sanitize_name  # type: ignore
 except ImportError:  # pragma: no cover
-    from ..utils import normalize_memory_title, parse_bool, sanitize_name  # type: ignore
+    from ..utils import get_ai_name, normalize_memory_title, parse_bool, sanitize_name  # type: ignore
 
 from ombrebrain.storage.backup_archive import (
     MAX_ARCHIVE_BYTES,
@@ -63,9 +63,15 @@ except ImportError:  # pragma: no cover
     )
 
 try:
-    from import_memory import preview_import  # type: ignore
+    from import_memory import (  # type: ignore
+        normalize_import_identity_labels,
+        preview_import,
+    )
 except ImportError:  # pragma: no cover
-    from ..import_memory import preview_import  # type: ignore
+    from ..import_memory import (
+        normalize_import_identity_labels,
+        preview_import,
+    )
 
 
 _DEFAULT_MAX_IMPORT_UPLOAD_BYTES = 4 * 1024 * 1024
@@ -457,13 +463,25 @@ def register(mcp) -> None:
                     {"ok": False, "error": "Empty file"}, status_code=400
                 )
 
-            human_label = str((sh.config or {}).get("human") or "用户")
+            try:
+                human_label, assistant_label = normalize_import_identity_labels(
+                    human_label=request.query_params.get("human_label"),
+                    assistant_label=request.query_params.get("assistant_label"),
+                )
+            except ValueError as exc:
+                return JSONResponse(
+                    {"ok": False, "error": str(exc)},
+                    status_code=400,
+                )
             try:
                 preview = await _await_history_worker(
                     preview_import,
                     raw_content,
                     filename,
-                    human_label,
+                    str((sh.config or {}).get("human") or "用户"),
+                    get_ai_name(),
+                    echo_human_label=human_label,
+                    echo_assistant_label=assistant_label,
                 )
             except Exception as exc:
                 logger.warning(
@@ -537,10 +555,20 @@ def register(mcp) -> None:
 
             preserve_raw = request.query_params.get("preserve_raw", "").lower() in ("1", "true")
             resume = request.query_params.get("resume", "").lower() in ("1", "true")
+            human_label, assistant_label = normalize_import_identity_labels(
+                human_label=request.query_params.get("human_label"),
+                assistant_label=request.query_params.get("assistant_label"),
+            )
 
         except asyncio.CancelledError:
             release_job()
             raise
+        except ValueError as e:
+            release_job()
+            return JSONResponse(
+                {"error": str(e)},
+                status_code=400,
+            )
         except Exception as e:
             release_job()
             return JSONResponse({"error": f"Failed to read upload: {e}"}, status_code=400)
@@ -555,6 +583,8 @@ def register(mcp) -> None:
                     preserve_raw,
                     resume,
                     reservation_id=job_id,
+                    human_label=human_label,
+                    assistant_label=assistant_label,
                 )
                 raw_content = ""
                 result = await start_coro

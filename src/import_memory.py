@@ -29,6 +29,7 @@ import logging
 import math
 import re
 import threading
+import unicodedata
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +70,8 @@ _JOB_ID_HEX = 16               # import job id：仅用于并发预留与状态�
 _STATE_ERR_LOG_MAX = 100       # errors 数组最多保留条数（避免状态文件肨胀）
 _CHUNK_ERR_PREVIEW = 200       # 单 chunk 错误信息截断长度
 _IMPORT_PARSER_VERSION = "speaker-role-v1"
+_IMPORT_HUMAN_LABEL_MAX_CHARS = 20
+_IMPORT_ASSISTANT_LABEL_MAX_CHARS = 40
 
 # --- _extract_memories LLM 调用 ---
 # chunk_turns() 必须保证每块都不超过该上限；_extract_memories() 只做防御性
@@ -227,20 +230,30 @@ def _source_hash(human_label: str, ai_label: str, raw_content: str) -> str:
 def _prepare_import(
     raw_content: str,
     filename: str,
-    human_label: str,
-    ai_label: str,
+    default_human_label: str,
+    default_ai_label: str,
+    human_label: str | None = None,
+    assistant_label: str | None = None,
 ) -> tuple[str, int, list[dict]]:
     """CPU/memory-heavy parsing entry point run outside the event loop."""
 
-    source_hash = _source_hash(human_label, ai_label, raw_content)
-    turns = detect_and_parse(
+    turns, resolved_human, resolved_assistant, _identity_applied = (
+        _parse_with_import_identity(
+            raw_content,
+            filename,
+            default_human_label=default_human_label,
+            default_ai_label=default_ai_label,
+            human_label=human_label,
+            assistant_label=assistant_label,
+        )
+    )
+    source_hash = _source_hash(
+        resolved_human,
+        resolved_assistant,
         raw_content,
-        filename,
-        human_label=human_label,
-        ai_label=ai_label,
     )
     turns_count = len(turns)
-    chunks = chunk_turns(turns, human_label=human_label) if turns else []
+    chunks = chunk_turns(turns, human_label=resolved_human) if turns else []
     turns.clear()
     return source_hash, turns_count, chunks
 
@@ -389,6 +402,106 @@ _ECHO_MESSAGE_HEADER_RE = re.compile(
 )
 
 
+def _echo_message_headers(lines: list[str]) -> list[tuple[int, re.Match[str]]]:
+    """Return Echo Markdown message headers using the parser's exact grammar."""
+
+    return [
+        (index, match)
+        for index, line in enumerate(lines)
+        if (match := _ECHO_MESSAGE_HEADER_RE.match(line.strip()))
+    ]
+
+
+def _normalize_import_identity_label(
+    value: str | None,
+    *,
+    field: str,
+    max_chars: int,
+) -> str | None:
+    """Validate one optional per-import identity label."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if len(normalized) > max_chars:
+        raise ValueError(f"{field} must be at most {max_chars} characters")
+    if any(unicodedata.category(char).startswith("C") for char in normalized):
+        raise ValueError(f"{field} must not contain control characters")
+    return normalized
+
+
+def normalize_import_identity_labels(
+    *,
+    human_label: str | None = None,
+    assistant_label: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Validate optional per-import labels without inspecting uploaded content."""
+
+    requested_human = _normalize_import_identity_label(
+        human_label,
+        field="human_label",
+        max_chars=_IMPORT_HUMAN_LABEL_MAX_CHARS,
+    )
+    requested_assistant = _normalize_import_identity_label(
+        assistant_label,
+        field="assistant_label",
+        max_chars=_IMPORT_ASSISTANT_LABEL_MAX_CHARS,
+    )
+    if (
+        requested_human
+        and requested_assistant
+        and requested_human.casefold() == requested_assistant.casefold()
+    ):
+        raise ValueError("human_label and assistant_label must be different")
+    return requested_human, requested_assistant
+
+
+def _parse_with_import_identity(
+    raw_content: str,
+    filename: str,
+    *,
+    default_human_label: str,
+    default_ai_label: str,
+    human_label: str | None = None,
+    assistant_label: str | None = None,
+) -> tuple[list[dict], str, str, bool]:
+    """Parse once and resolve Echo labels from the parser's actual output."""
+
+    requested_human, requested_assistant = normalize_import_identity_labels(
+        human_label=human_label,
+        assistant_label=assistant_label,
+    )
+    fallback_human = str(default_human_label)
+    fallback_assistant = str(default_ai_label)
+    echo_headers = _echo_message_headers(raw_content.split("\n"))
+    if echo_headers:
+        parse_human = requested_human or fallback_human
+        parse_assistant = requested_assistant or fallback_assistant
+    else:
+        parse_human = fallback_human
+        parse_assistant = fallback_assistant
+    if echo_headers and parse_human.casefold() == parse_assistant.casefold():
+        raise ValueError("human_label and assistant_label must be different")
+
+    turns = detect_and_parse(
+        raw_content,
+        filename,
+        human_label=parse_human,
+        ai_label=parse_assistant,
+    )
+    identity_applied = any(
+        "speaker" in turn and "sequence" in turn
+        for turn in turns
+    )
+    if not identity_applied:
+        return turns, fallback_human, fallback_assistant, False
+    return turns, parse_human, parse_assistant, True
+
+
 def _parse_markdown(
     text: str,
     *,
@@ -397,11 +510,7 @@ def _parse_markdown(
 ) -> list[dict]:
     """Parse Markdown/plain text → [{role, content, timestamp}, ...]"""
     lines = text.split("\n")
-    echo_headers = [
-        (index, match)
-        for index, line in enumerate(lines)
-        if (match := _ECHO_MESSAGE_HEADER_RE.match(line.strip()))
-    ]
+    echo_headers = _echo_message_headers(lines)
     if echo_headers:
         turns = []
         human_key = human_label.strip().casefold()
@@ -727,6 +836,9 @@ def preview_import(
     filename: str = "",
     human_label: str = "用户",
     ai_label: str | None = None,
+    *,
+    echo_human_label: str | None = None,
+    echo_assistant_label: str | None = None,
 ) -> dict[str, Any]:
     """Return a local-only preview of an import file without mutating state."""
     warnings: list[str] = []
@@ -742,12 +854,15 @@ def preview_import(
         }
 
     detected_format = _detect_preview_format(raw_content, filename, warnings)
-    resolved_ai_label = ai_label or get_ai_name()
-    turns = detect_and_parse(
-        raw_content,
-        filename,
-        human_label=human_label,
-        ai_label=resolved_ai_label,
+    turns, resolved_human, resolved_assistant, identity_applied = (
+        _parse_with_import_identity(
+            raw_content,
+            filename,
+            default_human_label=human_label,
+            default_ai_label=ai_label or get_ai_name(),
+            human_label=echo_human_label,
+            assistant_label=echo_assistant_label,
+        )
     )
     if not turns:
         return {
@@ -760,7 +875,7 @@ def preview_import(
             "warnings": warnings,
         }
 
-    chunks = chunk_turns(turns, human_label=human_label)
+    chunks = chunk_turns(turns, human_label=resolved_human)
     if not chunks:
         return {
             "ok": False,
@@ -783,6 +898,11 @@ def preview_import(
         "estimated_tokens": token_estimate,
         "warnings": warnings,
         "first_chunk_preview": first_preview,
+        "identity_mapping": {
+            "applied": identity_applied,
+            "human_label": resolved_human,
+            "assistant_label": resolved_assistant,
+        },
         "sample_turns": [
             {
                 "role": str(turn.get("role", "")),
@@ -1069,6 +1189,8 @@ class ImportEngine:
         resume: bool = False,
         *,
         reservation_id: str | None = None,
+        human_label: str | None = None,
+        assistant_label: str | None = None,
     ) -> dict:
         """
         Start or resume an import.
@@ -1102,8 +1224,12 @@ class ImportEngine:
                     keep_progress=resume_state_loaded,
                 )
 
-            _human = self.config.get("human", "用户")
-            _ai = get_ai_name()
+            requested_human, requested_assistant = normalize_import_identity_labels(
+                human_label=human_label,
+                assistant_label=assistant_label,
+            )
+            default_human = str(self.config.get("human", "用户"))
+            default_assistant = get_ai_name()
             # source_hash 必须把 parser 版本和双方显示名都算进去：它们会影响解析、
             # 行前缀和 token 边界。否则暂停期间身份配置或 parser 改变后，恢复任务
             # 会复用一份边界已经不同的旧进度。
@@ -1112,13 +1238,16 @@ class ImportEngine:
             # "source_hash 不一致" 分支识别为「源变了」，走全新导入而不是错位续传。
             # 解析 JSON 导出和构造分块字符串会显著放大内存；把 CPU 密集工作移出
             # 事件循环，增量计算源摘要，并且只保留最终分块。
-            source_hash, turns_count, prepared_chunks = await _await_import_worker(
+            prepared_import = await _await_import_worker(
                 _prepare_import,
                 raw_content,
                 filename,
-                str(_human),
-                _ai,
+                default_human,
+                default_assistant,
+                requested_human,
+                requested_assistant,
             )
+            source_hash, turns_count, prepared_chunks = prepared_import
             raw_content = ""
 
             # 检查是否续传

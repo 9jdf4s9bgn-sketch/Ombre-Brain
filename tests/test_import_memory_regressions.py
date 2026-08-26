@@ -18,11 +18,14 @@ from import_memory import (
     ImportEngine,
     ImportState,
     _EXTRACT_TOKEN_CEILING,
+    _parse_with_import_identity,
+    _prepare_import,
     _source_hash,
     _safe_import_error_detail,
     chunk_turns,
     detect_and_parse,
     diagnose_import_errors,
+    normalize_import_identity_labels,
 )
 from tools import _runtime as rt
 from tools._common import count_high_importance
@@ -361,6 +364,81 @@ def test_echo_markdown_unknown_speaker_is_preserved_without_role_guessing():
     assert 'role=unknown speaker="第三方"' in chunk_turns(turns)[0]["content"]
 
 
+@pytest.mark.parametrize("assistant_label", ["尼奥", "姐姐"])
+def test_echo_markdown_uses_explicit_per_import_identity_mapping(assistant_label):
+    raw = f"""1｜2026-08-25 10:00:00.000 +08:00｜松松｜\\
+第一条
+
+2｜2026-08-25 10:00:01.000 +08:00｜{assistant_label}｜\\
+第二条
+"""
+
+    turns, human, assistant, applied = _parse_with_import_identity(
+        raw,
+        "echo.md",
+        default_human_label="人类",
+        default_ai_label="AI",
+        human_label=" 松松 ",
+        assistant_label=f" {assistant_label} ",
+    )
+
+    assert applied is True
+    assert (human, assistant) == ("松松", assistant_label)
+    assert [(turn["speaker"], turn["role"]) for turn in turns] == [
+        ("松松", "user"),
+        (assistant_label, "assistant"),
+    ]
+    assert [turn["sequence"] for turn in turns] == [1, 2]
+    assert [turn["timestamp"] for turn in turns] == [
+        "2026-08-25 10:00:00.000 +08:00",
+        "2026-08-25 10:00:01.000 +08:00",
+    ]
+    assert [turn["content"] for turn in turns] == ["第一条", "第二条"]
+
+
+def test_echo_markdown_without_mapping_uses_global_fallback():
+    raw = """1｜2026-08-25 10:00:00.000 +08:00｜人类｜\\
+你好
+
+2｜2026-08-25 10:00:01.000 +08:00｜AI｜\\
+你好呀
+"""
+
+    turns, human, assistant, applied = _parse_with_import_identity(
+        raw,
+        "echo.md",
+        default_human_label="人类",
+        default_ai_label="AI",
+    )
+
+    assert applied is True
+    assert (human, assistant) == ("人类", "AI")
+    assert [(turn["speaker"], turn["role"]) for turn in turns] == [
+        ("人类", "user"),
+        ("AI", "assistant"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("human_label", "assistant_label", "error"),
+    [
+        ("同名", "同名", "must be different"),
+        ("松\n松", "尼奥", "control characters"),
+        ("松松", "尼" * 41, "at most 40"),
+    ],
+)
+def test_explicit_import_identity_mapping_is_validated(
+    human_label,
+    assistant_label,
+    error,
+):
+    with pytest.raises(ValueError, match=error):
+        normalize_import_identity_labels(
+            human_label=human_label,
+            assistant_label=assistant_label,
+        )
+
+
 def test_echo_markdown_preserves_sequence_gaps_without_repairing_them():
     raw = """7｜2026-07-28 21:38:03.035 +08:00｜松松｜\\
 第一条
@@ -448,10 +526,69 @@ def test_claude_and_chatgpt_json_role_parsing_remains_compatible():
     assert all("speaker" not in turn for turn in claude_turns + chatgpt_turns)
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "Human: 你好\nAssistant: 你好呀",
+        json.dumps({
+            "chat_messages": [
+                {"sender": "human", "text": "Claude 用户消息"},
+                {"sender": "assistant", "text": "Claude AI 消息"},
+            ]
+        }),
+        json.dumps({
+            "mapping": {
+                "user": {
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["ChatGPT 用户消息"]},
+                    }
+                }
+            }
+        }),
+    ],
+)
+def test_per_import_identity_mapping_is_ignored_outside_echo_markdown(raw):
+    turns, human, assistant, applied = _parse_with_import_identity(
+        raw,
+        "upload",
+        default_human_label="人类",
+        default_ai_label="AI",
+        human_label="松松",
+        assistant_label="尼奥",
+    )
+
+    assert (human, assistant, applied) == ("人类", "AI", False)
+    assert all("speaker" not in turn for turn in turns)
+
+
 def test_source_hash_changes_when_ai_identity_changes():
     raw = "Human: 你好\nAssistant: 你好呀"
 
     assert _source_hash("松松", "尼奥", raw) != _source_hash("松松", "其他AI", raw)
+
+
+def test_source_hash_changes_with_resolved_per_import_mapping():
+    raw = "1｜2026-08-25 10:00:00.000 +08:00｜松松｜\\\n你好"
+
+    neo = _prepare_import(
+        raw,
+        "echo.md",
+        default_human_label="人类",
+        default_ai_label="AI",
+        human_label="松松",
+        assistant_label="尼奥",
+    )
+    sister = _prepare_import(
+        raw,
+        "echo.md",
+        default_human_label="人类",
+        default_ai_label="AI",
+        human_label="松松",
+        assistant_label="姐姐",
+    )
+
+    assert neo[0] != sister[0]
 
 
 def test_chunk_turns_rejects_non_positive_budget():
