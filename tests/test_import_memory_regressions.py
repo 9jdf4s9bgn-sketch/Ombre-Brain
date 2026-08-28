@@ -10,6 +10,7 @@
 """
 import json
 import os
+from datetime import datetime
 from unittest.mock import MagicMock
 
 import pytest
@@ -91,6 +92,7 @@ class FakeBucketManager:
         self.created.append({
             "id": bid, "content": content, "domain": domain or [],
             "tags": tags or [], "name": name,
+            "title": _kw.get("title", ""),
             "source_tool": _kw.get("source_tool"),
             "imported": _kw.get("imported", False),
         })
@@ -112,6 +114,9 @@ class FakeBucketManager:
         return None
 
     async def update(self, bucket_id, **_kw):
+        for bucket in self.created:
+            if bucket["id"] == bucket_id and "title" in _kw:
+                bucket["title"] = _kw["title"]
         return True
 
 
@@ -347,6 +352,128 @@ def test_echo_markdown_preserves_speaker_role_sequence_timestamp_and_content():
     assert "来源：测试" not in evidence
 
 
+@pytest.mark.asyncio
+async def test_echo_source_date_sets_title_without_changing_created(
+    bucket_mgr,
+    test_config,
+    monkeypatch,
+):
+    import bucket_manager as bucket_manager_module
+
+    raw = """20274｜2026-08-05 20:53:56.237 +08:00｜松松｜
+抱抱 老公 喂我一个泡芙
+
+20275｜2026-08-05 20:55:35.173 +08:00｜尼奥｜
+泡芙是饭后甜点 我喂你
+"""
+    turns = detect_and_parse(
+        raw,
+        filename="echo.md",
+        human_label="松松",
+        ai_label="尼奥",
+    )
+    chunk = chunk_turns(turns, human_label="松松")[0]
+    item = {
+        "name": "泡芙与晚餐安排",
+        "content": "松松回家后想吃泡芙，尼奥安排先吃晚餐。",
+        "domain": ["饮食"],
+        "importance": 5,
+    }
+    engine = ImportEngine(
+        test_config,
+        bucket_mgr,
+        FakeDehydrator(extraction_items=[item]),
+    )
+    monkeypatch.setattr(
+        bucket_manager_module,
+        "now_iso",
+        lambda: "2026-08-28T15:53:19+08:00",
+    )
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 8, 28, 15, 53, 19, tzinfo=tz)
+
+    monkeypatch.setattr(bucket_manager_module, "datetime", FrozenDateTime)
+
+    assert chunk["source_date"] == "2026-08-05"
+    assert await engine._process_single_chunk(chunk, preserve_raw=False) is True
+
+    imported = next(
+        bucket
+        for bucket in await bucket_mgr.list_all(include_archive=False)
+        if bucket["content"] == item["content"]
+    )
+    assert imported["metadata"]["name"] == "2026-08-28 15-53-19 泡芙与晚餐安排"
+    assert imported["metadata"]["title"] == "2026-08-05 泡芙与晚餐安排"
+    assert imported["metadata"]["created"] == "2026-08-28T15:53:19+08:00"
+    assert imported["metadata"]["last_active"] == imported["metadata"]["created"]
+
+
+@pytest.mark.parametrize("first_timestamp", ["", "not-a-timestamp"])
+def test_echo_source_date_uses_first_valid_timestamp_across_midnight(
+    first_timestamp,
+):
+    turns = [
+        {
+            "role": "user",
+            "speaker": "松松",
+            "sequence": 1,
+            "content": "缺少有效时间",
+            "timestamp": first_timestamp,
+        },
+        {
+            "role": "assistant",
+            "speaker": "尼奥",
+            "sequence": 2,
+            "content": "午夜前",
+            "timestamp": "2026-08-05 23:59:59.999 +08:00",
+        },
+        {
+            "role": "user",
+            "speaker": "松松",
+            "sequence": 3,
+            "content": "午夜后",
+            "timestamp": "2026-08-06 00:00:00.001 +08:00",
+        },
+    ]
+
+    chunk = chunk_turns(turns, human_label="松松")[0]
+
+    expected_start = first_timestamp or "2026-08-05 23:59:59.999 +08:00"
+    assert chunk["timestamp_start"] == expected_start
+    assert chunk["source_date"] == "2026-08-05"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timestamp", ["", "not-a-timestamp", "2026-02-30 12:00:00"])
+async def test_echo_without_valid_timestamp_keeps_title_fallback(tmp_path, timestamp):
+    turns = [
+        {
+            "role": "user",
+            "speaker": "松松",
+            "sequence": 1,
+            "content": "原始内容",
+            "timestamp": timestamp,
+        }
+    ]
+    chunk = chunk_turns(turns, human_label="松松")[0]
+    bucket_mgr = FakeBucketManager()
+    engine = ImportEngine(
+        {"buckets_dir": str(tmp_path), "human": "松松"},
+        bucket_mgr,
+        FakeDehydrator(extraction_items=[{
+            "name": "原有标题",
+            "content": "没有可靠来源日期的记忆正文。",
+        }]),
+    )
+
+    assert "source_date" not in chunk
+    assert await engine._process_single_chunk(chunk, preserve_raw=False) is True
+    assert bucket_mgr.created[0]["name"] == "原有标题"
+    assert bucket_mgr.created[0]["title"] == ""
+
+
 def test_echo_markdown_unknown_speaker_is_preserved_without_role_guessing():
     raw = """1｜2026-07-28 21:38:03.035 +08:00｜第三方｜\\
 第三方原文
@@ -524,6 +651,57 @@ def test_claude_and_chatgpt_json_role_parsing_remains_compatible():
         "ChatGPT AI 消息",
     ]
     assert all("speaker" not in turn for turn in claude_turns + chatgpt_turns)
+    assert "source_date" not in chunk_turns(claude_turns)[0]
+    assert "source_date" not in chunk_turns(chatgpt_turns)[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw", "filename"),
+    [
+        (
+            json.dumps({
+                "chat_messages": [{
+                    "sender": "human",
+                    "text": "Claude 用户消息",
+                    "created_at": "2026-08-05T20:53:56+08:00",
+                }]
+            }),
+            "claude.json",
+        ),
+        (
+            json.dumps({
+                "mapping": {
+                    "user": {
+                        "message": {
+                            "author": {"role": "user"},
+                            "content": {"parts": ["ChatGPT 用户消息"]},
+                            "create_time": 1785944036,
+                        }
+                    }
+                }
+            }),
+            "chatgpt.json",
+        ),
+        ("Human: 你好\nAssistant: 你好呀", "legacy.md"),
+    ],
+)
+async def test_non_echo_formats_do_not_set_source_date_title(tmp_path, raw, filename):
+    turns = detect_and_parse(raw, filename=filename, human_label="松松", ai_label="尼奥")
+    chunk = chunk_turns(turns, human_label="松松")[0]
+    bucket_mgr = FakeBucketManager()
+    engine = ImportEngine(
+        {"buckets_dir": str(tmp_path), "human": "松松"},
+        bucket_mgr,
+        FakeDehydrator(extraction_items=[{
+            "name": "原有标题",
+            "content": f"{filename} 的历史导入记忆正文。",
+        }]),
+    )
+
+    assert "source_date" not in chunk
+    assert await engine._process_single_chunk(chunk, preserve_raw=False) is True
+    assert bucket_mgr.created[0]["title"] == ""
 
 
 @pytest.mark.parametrize(

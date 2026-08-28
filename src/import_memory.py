@@ -699,6 +699,29 @@ def _split_oversized_turn(
     return parts
 
 
+_ECHO_TIMESTAMP_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?"
+    r"(?:\s*(?:Z|[+-]\d{2}:\d{2}))?$",
+    re.IGNORECASE,
+)
+
+
+def _echo_source_date(turn: dict) -> str:
+    """Return the source calendar date for one valid Echo message timestamp."""
+
+    if "speaker" not in turn or turn.get("sequence") is None:
+        return ""
+    raw = str(turn.get("timestamp", "")).strip()
+    if not raw or not _ECHO_TIMESTAMP_RE.fullmatch(raw):
+        return ""
+    normalized = raw[:-1] + "+00:00" if raw[-1:].lower() == "z" else raw
+    normalized = re.sub(r"\s+([+-]\d{2}:\d{2})$", r"\1", normalized)
+    try:
+        return datetime.fromisoformat(normalized).date().isoformat()
+    except ValueError:
+        return ""
+
+
 def chunk_turns(turns: list[dict], target_tokens: int = _CHUNK_TARGET_TOKENS, human_label: str = "用户") -> list[dict]:
     """
     按对话轮次边界将对话分为 ~target_tokens 大小的窗口。
@@ -713,6 +736,7 @@ def chunk_turns(turns: list[dict], target_tokens: int = _CHUNK_TARGET_TOKENS, hu
     current_tokens = 0
     first_ts = ""
     last_ts = ""
+    source_date = ""
     turn_count = 0
 
     for turn in turns:
@@ -737,6 +761,7 @@ def chunk_turns(turns: list[dict], target_tokens: int = _CHUNK_TARGET_TOKENS, hu
             )
             line_prefix = f"[{role_label}] "
         turn_content = str(turn.get("content", ""))
+        turn_source_date = _echo_source_date(turn)
         line = line_prefix + turn_content
         line_tokens = count_tokens_approx(line)
         # 逐行估算会在每行向下取整，直接相加会系统性低估许多短消息。
@@ -748,56 +773,72 @@ def chunk_turns(turns: list[dict], target_tokens: int = _CHUNK_TARGET_TOKENS, hu
         if line_tokens > target_tokens:
             # Flush current
             if current_lines:
-                chunks.append({
+                chunk = {
                     "content": "\n".join(current_lines),
                     "timestamp_start": first_ts,
                     "timestamp_end": last_ts,
                     "turn_count": turn_count,
-                })
+                }
+                if source_date:
+                    chunk["source_date"] = source_date
+                chunks.append(chunk)
                 current_lines = []
                 current_tokens = 0
                 turn_count = 0
                 first_ts = ""
+                source_date = ""
 
             for part in _split_oversized_turn(
                 turn_content,
                 line_prefix=line_prefix,
                 target_tokens=target_tokens,
             ):
-                chunks.append({
+                chunk = {
                     "content": part,
                     "timestamp_start": turn.get("timestamp", ""),
                     "timestamp_end": turn.get("timestamp", ""),
                     "turn_count": 1,
-                })
+                }
+                if turn_source_date:
+                    chunk["source_date"] = turn_source_date
+                chunks.append(chunk)
             continue
 
         if current_tokens + line_budget > target_tokens and current_lines:
-            chunks.append({
+            chunk = {
                 "content": "\n".join(current_lines),
                 "timestamp_start": first_ts,
                 "timestamp_end": last_ts,
                 "turn_count": turn_count,
-            })
+            }
+            if source_date:
+                chunk["source_date"] = source_date
+            chunks.append(chunk)
             current_lines = []
             current_tokens = 0
             turn_count = 0
             first_ts = ""
+            source_date = ""
 
         if not first_ts:
             first_ts = turn.get("timestamp", "")
+        if not source_date and turn_source_date:
+            source_date = turn_source_date
         last_ts = turn.get("timestamp", "")
         current_lines.append(line)
         current_tokens += line_budget
         turn_count += 1
 
     if current_lines:
-        chunks.append({
+        chunk = {
             "content": "\n".join(current_lines),
             "timestamp_start": first_ts,
             "timestamp_end": last_ts,
             "turn_count": turn_count,
-        })
+        }
+        if source_date:
+            chunk["source_date"] = source_date
+        chunks.append(chunk)
 
     return chunks
 
@@ -1414,7 +1455,12 @@ class ImportEngine:
                 type(exc).__name__,
             )
 
-    async def _create_import_bucket(self, item: dict) -> str:
+    async def _create_import_bucket(
+        self,
+        item: dict,
+        *,
+        source_date: str = "",
+    ) -> str:
         """在普通高重要度配额内创建一条导入记忆。"""
         requested_importance = item.get(
             "importance", _DEFAULT_IMPORTANCE
@@ -1425,18 +1471,23 @@ class ImportEngine:
             *,
             defer_derived_index: bool = False,
         ) -> str:
-            return await self.bucket_mgr.create(
+            name = str(item.get("name") or "")
+            title = f"{source_date} {name}" if source_date and name else ""
+            bucket_id = await self.bucket_mgr.create(
                 content=item["content"],
                 tags=item.get("tags", []),
                 importance=final_importance,
                 domain=item.get("domain", ["未分类"]),
                 valence=item.get("valence", _DEFAULT_VALENCE),
                 arousal=item.get("arousal", _DEFAULT_AROUSAL),
-                name=item.get("name") or None,
+                name=name or None,
                 source_tool="import",
                 imported=True,
                 defer_derived_index=defer_derived_index,
             )
+            if title and not await self.bucket_mgr.update(bucket_id, title=title):
+                raise RuntimeError("Failed to persist imported memory title")
+            return bucket_id
 
         if requested_importance >= _HIGH_IMP_THRESHOLD:
             async with _quota_turn("high_importance"):
@@ -1492,7 +1543,10 @@ class ImportEngine:
 
                 # 历史导入保留来源：不能因为语义检索相似就修改旧记忆。
                 # 仅按正文精确去重，确保崩溃续跑仍然幂等。
-                created = await self._create_import_item_if_new(item)
+                created = await self._create_import_item_if_new(
+                    item,
+                    source_date=str(chunk.get("source_date") or ""),
+                )
                 if not created:
                     self.state.data["memories_skipped"] += 1
                     continue
@@ -1661,14 +1715,19 @@ class ImportEngine:
             )
         return validated
 
-    async def _create_import_item_if_new(self, item: dict) -> bool:
+    async def _create_import_item_if_new(
+        self,
+        item: dict,
+        *,
+        source_date: str = "",
+    ) -> bool:
         """仅当不存在完全相同正文时创建导入桶。"""
 
         digest = self._content_digest(item["content"])
         if self._exact_content_hashes is not None:
             if digest in self._exact_content_hashes:
                 return False
-            await self._create_import_bucket(item)
+            await self._create_import_bucket(item, source_date=source_date)
             self._exact_content_hashes.add(digest)
             return True
 
@@ -1689,7 +1748,7 @@ class ImportEngine:
                     type(exc).__name__,
                 )
 
-        await self._create_import_bucket(item)
+        await self._create_import_bucket(item, source_date=source_date)
         return True
     async def detect_patterns(self) -> list[dict]:
         """
